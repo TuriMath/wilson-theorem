@@ -1,0 +1,14 @@
+{
+  "slug": "WilsonTheorem",
+  "issue": "TuriMath/wilson-theorem#1",
+  "tier": 1,
+  "source": "Hardy & Wright, Thm 80; Wikipedia 'Wilson's theorem'",
+  "statement_provenance": "blind-double",
+  "verdict": "proved",
+  "attempts": {"formalize_rounds": 1, "equiv": 1, "prove": 1},
+  "mathlib_lemmas": ["FiniteField.prod_univ_units_id_eq_neg_one", "Finset.prod_Ico_id_eq_factorial", "Finset.prod_bij", "ZMod.intCast_eq_intCast_iff", "Nat.minFac_prime", "Nat.dvd_factorial"],
+  "calibration": true,
+  "toolchain": "leanprover/lean4:v4.36.0",
+  "mathlib_rev": "fc4f59e577feb1a4956671bc04ac18aaaf8cd842",
+  "notes": "Did not cite ZMod.wilsons_lemma or Nat.prime_iff_fac_equiv_neg_one. Forward: product of nonzero elements of ZMod p equals product of units (bijection via val), which is -1. Reverse: least prime factor p of composite n divides (n-1)! and n | (n-1)!+1, so p | 1."
+}

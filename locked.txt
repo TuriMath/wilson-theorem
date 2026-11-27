@@ -1,1 +1,4 @@
 # sha256  path. Statements locked after their A<->B PR merged. Lines are only ever added (scripts/gate.py, check 6).
+9c1924c3f4c4f317e54f078cfe3cc2b2716fd8f61794b7d41785663e860ac275  Theorems/WilsonTheorem/A.lean
+9e14a6ec4fe58ba8b8327709b3865735e53dd1a956e1225791c1e524a6aaff02  Theorems/WilsonTheorem/B.lean
+0e9c3c7ea007041a09a72e133fb66e713efcdca7daef5c6f0890ecdc826a04c9  Theorems/WilsonTheorem/Equiv.lean

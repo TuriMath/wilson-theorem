@@ -28,7 +28,13 @@ THMS = ROOT / "Theorems"
 ALLOWED_AXIOMS = {"propext", "Classical.choice", "Quot.sound"}
 REQUIRED_FIELDS = {"slug", "issue", "tier", "source", "statement_provenance", "verdict", "attempts",
                    "mathlib_lemmas", "toolchain", "mathlib_rev"}
-FORBIDDEN = re.compile(r"\b(sorry|admit)\b|^\s*(private\s+|protected\s+)?axiom\b", re.M)
+# Check 3 reads the RAW file text: no comment or string stripping, so no lexer to fool. Every trick for hiding a
+# sorry/axiom or silencing Lean's warnings has to write one of these words somewhere in the file, even inside a comment
+# or string; so theorem files may not contain them at all (reword the comment). `\b` keeps `axioms`, `axiomatic`,
+# `my_axiom` and `macro_rules` out of the plain words. The Lean-side checks (3b, the build warning check) still run.
+FORBIDDEN_WORDS = ["sorry", "admit", "axiom", "native_decide", "guard_msgs", "implemented_by", "extern", "elab",
+                   "macro", "syntax", "run_cmd", "run_tac", "run_elab", "macro_rules", "elab_rules"]
+FORBIDDEN = re.compile(r"\b(?:" + "|".join(FORBIDDEN_WORDS) + r")\b|\b(?:warn|debug)\.|#eval")
 
 failures: list[str] = []
 
@@ -46,11 +52,6 @@ def run(cmd, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, **kw)
 
 
-def strip_comments(src: str) -> str:
-    src = re.sub(r"/-.*?-/", "", src, flags=re.S)
-    return re.sub(r"--[^\n]*", "", src)
-
-
 def module(path: Path) -> str:
     return ".".join(path.relative_to(ROOT).with_suffix("").parts)
 
@@ -60,9 +61,19 @@ def slugs() -> list[str]:
 
 
 # ---------- checks ----------
+INDEX_LINE = re.compile(r"^(?:import\s+Theorems(?:\.\w+)+\s*|--.*|\s*)$")
+
+
+def index_violations(text: str) -> list[str]:
+    """Lines of Theorems.lean that are not `import Theorems.…`, blank, or a `--` comment. It is an index file only."""
+    return [l for l in text.splitlines() if not INDEX_LINE.match(l)]
+
+
 def check_imports():
-    print("1. Every file is imported by Theorems.lean")
+    print("1. Every file is imported by Theorems.lean, and Theorems.lean is only an index")
     root = ROOT / "Theorems.lean"
+    for l in index_violations(root.read_text()) if root.exists() else []:
+        fail(f"Theorems.lean may only contain `import Theorems.…` lines, blanks and `--` comments; found: {l.strip()}")
     imported = set(re.findall(r"^import\s+(\S+)", root.read_text(), re.M)) if root.exists() else set()
     missing = [module(p) for p in sorted(THMS.rglob("*.lean"))] if THMS.exists() else []
     missing = [m for m in missing if m not in imported]
@@ -78,15 +89,21 @@ def check_build():
     if r.returncode != 0:
         fail("lake build failed")
         print((r.stdout + r.stderr)[-4000:])
+    elif SORRY_WARNING.search(r.stdout + r.stderr):
+        fail("lake build reports `declaration uses sorry` (Lean's own warning; covers `example`, which check 3b cannot see)")
+        print("\n".join(l for l in (r.stdout + r.stderr).splitlines() if SORRY_WARNING.search(l)))
     else:
-        ok("lake build succeeded")
+        ok("lake build succeeded, no sorry warnings")
 
 
 def check_forbidden():
-    print("3. No sorry / admit / axiom")
+    print("3. Raw-text scan: no sorry / axiom / native_decide / warning-silencing / meta-programming words")
     bad = 0
-    for p in sorted(THMS.rglob("*.lean")) if THMS.exists() else []:
-        for m in FORBIDDEN.finditer(strip_comments(p.read_text())):
+    files = (sorted(THMS.rglob("*.lean")) if THMS.exists() else []) + [ROOT / "Theorems.lean"]  # root file is built too
+    for p in files:
+        if not p.exists():
+            continue
+        for m in FORBIDDEN.finditer(p.read_text()):
             fail(f"{p.relative_to(ROOT)}: `{m.group(0).strip()}`")
             bad += 1
     if not bad:
@@ -101,6 +118,59 @@ def lean_snippet(body: str, imports: str = "import Theorems") -> subprocess.Comp
         return run(["lake", "env", "lean", name], timeout=1200)
     finally:
         os.unlink(name)
+
+
+# The decisive check: let Lean list every declaration. Text scanning cannot match Lean's lexer (`«/-»`, `s!"{"/-"}"`...),
+# so this walks the environment instead. Any `axiom` declared in a Theorems module fails, and every declaration there
+# (helpers and sanity sections included, not just main/equiv) must depend only on the standard axioms.
+# Residual: an `example` is never added to the environment, so this cannot see it. A `sorry` there is still caught by
+# check 2 (Lean's own "declaration uses `sorry`" warning). `example := by native_decide` is not caught by Lean-side
+# checks (its aux axiom is discarded with the example); only the raw-text scan looks for it. That is a trust issue
+# (compiled code decides a true statement), not a false claim.
+SORRY_WARNING = re.compile(r"declaration uses [`']sorry")
+LEAN_SCAN = """
+open Lean Elab Command in
+#eval show CommandElabM Unit from do
+  let env ← getEnv
+  let allowed : List Name := [`propext, `Classical.choice, `Quot.sound]
+  let consts := env.constants.fold (init := #[]) fun acc n ci => acc.push (n, ci)
+  let mut count := 0
+  for (n, ci) in consts do
+    let ours := match env.getModuleIdxFor? n with
+      | some i => env.header.moduleNames[i.toNat]!.getRoot == `Theorems
+      | none => LOCAL_TOO
+    unless ours do continue
+    count := count + 1
+    match ci with
+    | .axiomInfo _ => IO.println s!"GATE-AXIOM {n}"
+    | _ =>
+      let axs ← collectAxioms n
+      let extra := axs.toList.filter (fun a => !allowed.contains a)
+      unless extra.length == 0 do IO.println s!"GATE-BAD {n}: {extra}"
+  IO.println s!"GATE-SCANNED {count}"
+"""
+LEAN_LINE = re.compile(r"^GATE-(AXIOM|BAD) (.*)$", re.M)
+
+
+def lean_scan(local_too: bool = False, imports: str = "import Lean\nimport Theorems", body: str = ""):
+    """(compiled ok, scanned count, [problem lines]) from walking the environment in Lean."""
+    r = lean_snippet(body + "\n" + LEAN_SCAN.replace("LOCAL_TOO", "true" if local_too else "false"), imports)
+    out = r.stdout + r.stderr
+    m = re.search(r"GATE-SCANNED (\d+)", out)
+    return r.returncode == 0 and m is not None, int(m.group(1)) if m else 0, \
+        [f"{k.lower()} {v}" for k, v in LEAN_LINE.findall(out)], out
+
+
+def check_lean_scan():
+    print("3b. Lean walks every Theorems declaration: no axiom, only standard axioms")
+    good, count, problems, out = lean_scan()
+    if not good:
+        fail("Lean declaration scan did not run")
+        print(out[-3000:])
+    for pr in problems:
+        fail(f"Lean scan: {pr}")
+    if good and not problems:
+        ok(f"{count} declarations in Theorems modules checked")
 
 
 AXIOM_LINE = re.compile(r"'([^']+)' depends on axioms: \[([^\]]*)\]")
@@ -209,20 +279,63 @@ def red_flags():
 # ---------- Gate 0 self-test ----------
 PLANTED = {
     "sorry": ("theorem planted : 1 + 1 = 3 := by sorry", "sorryAx"),
+    "attribute axiom": ("@[simp] axiom planted_ax : 1 + 1 = 3\ntheorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "modified axiom": ("set_option autoImplicit false in\n@[simp]\nprivate axiom planted_ax : 1 + 1 = 3\n"
+                       "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "same-line axiom": ("theorem t0 : True := trivial axiom planted_ax : 1 + 1 = 3\n"
+                        "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "axiom hidden by strings": ('def s1 := "/-"\naxiom planted_ax : 1 + 1 = 3\ndef s2 := "-/"\n'
+                                "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "quoted set_option": ('set_option trace.profiler.output "a b" in axiom planted_ax : 1 + 1 = 3\n'
+                          "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "guillemet-hidden axiom": ("def «/-» := 1\naxiom planted_ax : 1 + 1 = 3\ndef «-/» := 2\n"
+                               "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "interpolation-hidden axiom": ('def x1 := s!"{"/-"}"\naxiom planted_ax : 1 + 1 = 3\ndef x2 := s!"{"-/"}"\n'
+                                   "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "guillemet line comment": ("def «--» := 3 axiom planted_ax : 1 + 1 = 3\n"
+                               "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
+    "guillemet quote": ('def «"» := 4\naxiom planted_ax : 1 + 1 = 3\ndef «x"» := 5\n'
+                        "theorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
     "axiom": ("axiom planted_ax : 1 + 1 = 3\ntheorem planted : 1 + 1 = 3 := planted_ax", "planted_ax"),
 }
+
+
+# Forms that silence Lean's own sorry warning, so only the raw-text scan can catch them.
+RAW_PLANTS = {
+    "guard_msgs silences sorry warning": 'def x1 := s!"{"/-"}"\n/-- warning: declaration uses `sorry` -/\n#guard_msgs in\n'
+                                         'example : ∃ n : Nat, n + 1 = 0 := by sorry\ndef x2 := s!"{"-/"}"',
+    "warn.sorry false": 'def x1 := s!"{"/-"}"\nset_option warn.sorry false in\nexample : ∃ n : Nat, n + 1 = 0 := by sorry\n'
+                        'def x2 := s!"{"-/"}"',
+}
+SORRY_PLANT = ('def x1 := s!"{"/-"}"\nexample : ∃ n : Nat, n + 1 = 0 := by sorry\ndef x2 := s!"{"-/"}"')
 
 
 def selftest() -> int:
     print("Gate 0 self-test: the gate must reject a planted sorry and a planted extra axiom")
     errors = 0
     for name, (src, axiom) in PLANTED.items():
-        caught_text = bool(FORBIDDEN.search(strip_comments(src)))
-        r = lean_snippet(f"{src}\n#print axioms planted", "import Mathlib.Init")
-        caught_axioms = axiom in bad_axioms(r.stdout + r.stderr).get("planted", set())
-        status = "caught" if caught_text and caught_axioms else "MISSED"
-        print(f"  {name}: text scan {'✓' if caught_text else '✗'} · #print axioms {'✓' if caught_axioms else '✗'} → {status}")
+        caught_text = bool(FORBIDDEN.search(src))
+        good, _, problems, out = lean_scan(local_too=True, imports="import Lean\nimport Mathlib.Init", body=src)
+        caught_lean = good and any(" planted" in pr or axiom in pr for pr in problems)
+        status = "caught" if caught_lean and caught_text else "MISSED"      # both the raw scan and Lean must catch it
+        print(f"  {name}: Lean scan {'✓' if caught_lean else '✗'} · raw scan {'✓' if caught_text else '✗'} → {status}")
+        if not good:
+            print(out[-1500:])
         errors += status != "caught"
+    for name, src in RAW_PLANTS.items():
+        caught = bool(FORBIDDEN.search(src))
+        print(f"  {name}: raw text scan {'✓' if caught else '✗'} → {'caught' if caught else 'MISSED'}")
+        errors += not caught
+    root_plant = "import Theorems.Tmp.A\nimport Mathlib.Init\nset_option warn.sorry false in\nexample : ∃ n : Nat, n + 3 = 0 := by sorry\n"
+    ok_index = not index_violations("-- note\n\nimport Theorems.Tmp.A\nimport Theorems.Foo.Proof\n")
+    caught = bool(index_violations(root_plant)) and bool(FORBIDDEN.search(root_plant)) and ok_index
+    print(f"  code in root Theorems.lean: index check + raw scan {'✓' if caught else '✗'} → {'caught' if caught else 'MISSED'}")
+    errors += not caught
+    r = lean_snippet(SORRY_PLANT, "import Mathlib.Init")
+    caught = bool(SORRY_WARNING.search(r.stdout + r.stderr))
+    print(f"  example-sorry hidden by interpolation: raw scan {'✓' if FORBIDDEN.search(SORRY_PLANT) else '✗'}"
+          f" · Lean's sorry warning {'✓' if caught else '✗'} → {'caught' if caught else 'MISSED'}")
+    errors += not caught
     print("Gate 0 passed" if not errors else "Gate 0 FAILED")
     return 1 if errors else 0
 
@@ -234,6 +347,7 @@ def main() -> int:
     check_imports()
     check_build()
     check_forbidden()
+    check_lean_scan()
     if not failures:                 # the Lean checks need a successful build
         check_axioms_and_statements()
     check_locked()

@@ -2,3 +2,4 @@
 import Theorems.WilsonTheorem.A
 import Theorems.WilsonTheorem.B
 import Theorems.WilsonTheorem.Equiv
+import Theorems.WilsonTheorem.Proof
